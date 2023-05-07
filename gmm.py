@@ -3,7 +3,7 @@ import numpy as np
 
 from math import pi
 from scipy.special import logsumexp
-from utils import calculate_matmul, calculate_matmul_n_times
+from gmmtorch.utils import calculate_matmul, calculate_matmul_n_times
 
 
 class GaussianMixture(torch.nn.Module):
@@ -15,7 +15,7 @@ class GaussianMixture(torch.nn.Module):
     probabilities are shaped (n, k, 1) if they relate to an individual sample,
     or (1, k, 1) if they assign membership probabilities to one of the mixture components.
     """
-    def __init__(self, n_components, n_features, covariance_type="full", eps=1.e-6, init_params="kmeans", mu_init=None, var_init=None):
+    def __init__(self, n_components, n_features, covariance_type="full", eps=1.e-6, init_params="kmeans", mu_init=None, var_init=None, pi_init=None):
         """
         Initializes the model and brings all tensors into their required shape.
         The class expects data to be fed as a flat tensor in (n, d).
@@ -36,6 +36,7 @@ class GaussianMixture(torch.nn.Module):
         options:
             mu_init:         torch.Tensor (1, k, d)
             var_init:        torch.Tensor (1, k, d) or (1, k, d, d)
+            pi_init:         torch.Tensor (1, k, 1)
             covariance_type: str
             eps:             float
             init_params:     str
@@ -47,6 +48,7 @@ class GaussianMixture(torch.nn.Module):
 
         self.mu_init = mu_init
         self.var_init = var_init
+        self.pi_init = pi_init
         self.eps = eps
 
         self.log_likelihood = -np.inf
@@ -86,8 +88,12 @@ class GaussianMixture(torch.nn.Module):
                     requires_grad=False
                 )
 
-        # (1, k, 1)
-        self.pi = torch.nn.Parameter(torch.Tensor(1, self.n_components, 1), requires_grad=False).fill_(1. / self.n_components)
+        if self.pi_init is not None:
+            assert self.pi_init.size() == (1, self.n_components, 1), "Input mu_init does not have required tensor dimensions (1, %i, 1)" % (self.n_components)
+            # (1, k, 1)
+            self.pi = torch.nn.Parameter(self.pi_init, requires_grad=False)
+        else:
+            self.pi = torch.nn.Parameter(torch.Tensor(1, self.n_components, 1), requires_grad=False).fill_(1. / self.n_components)
         self.params_fitted = False
 
 
@@ -118,15 +124,16 @@ class GaussianMixture(torch.nn.Module):
         return bic
 
 
-    def fit(self, x, delta=1e-3, n_iter=100, warm_start=False):
+    def fit(self, x, delta=1e-3, n_iter=100, warm_start=False, learning_rate=1.):
         """
         Fits model to the data.
         args:
-            x:          torch.Tensor (n, d) or (n, k, d)
+            x:              torch.Tensor (n, d) or (n, k, d)
         options:
-            delta:      float
-            n_iter:     int
-            warm_start: bool
+            delta:          float
+            n_iter:         int
+            warm_start:     bool
+            learning_rate:  float
         """
         if not warm_start and self.params_fitted:
             self._init_params()
@@ -136,6 +143,10 @@ class GaussianMixture(torch.nn.Module):
         if self.init_params == "kmeans" and self.mu_init is None:
             mu = self.get_kmeans_mu(x, n_centers=self.n_components)
             self.mu.data = mu
+        
+        mu_start = self.mu
+        var_start = self.var
+        pi_start = self.pi
 
         i = 0
         j = np.inf
@@ -171,6 +182,9 @@ class GaussianMixture(torch.nn.Module):
                 self.__update_mu(mu_old)
                 self.__update_var(var_old)
 
+        self.__update_mu(learning_rate*self.mu + (1.-learning_rate)*mu_start)
+        self.__update_var(learning_rate*self.var + (1.-learning_rate)*var_start)
+        self.__update_pi(learning_rate*self.pi + (1.-learning_rate)*pi_start)
         self.params_fitted = True
 
 
@@ -191,7 +205,8 @@ class GaussianMixture(torch.nn.Module):
         weighted_log_prob = self._estimate_log_prob(x) + torch.log(self.pi)
 
         if probs:
-            p_k = torch.exp(weighted_log_prob)
+            # substract max to avoid too small values after exp(), will cancel out in normalization
+            p_k = torch.exp(weighted_log_prob-weighted_log_prob.max(1).values[:,None])
             return torch.squeeze(p_k / (p_k.sum(1, keepdim=True)))
         else:
             return torch.squeeze(torch.max(weighted_log_prob, 1)[1].type(torch.LongTensor))
@@ -246,6 +261,20 @@ class GaussianMixture(torch.nn.Module):
 
         score = self.__score(x, as_average=False)
         return score
+    
+    def predict_max_log_prob(self, x):
+        """
+        Computes the maximum log-likelihood that samples belong to a Gaussian under the current model.
+        args:
+            x:          torch.Tensor (n, d) or (n, 1, d)
+        returns:
+            max_log_porb:      torch.LongTensor (n)
+        """
+        x = self.check_size(x)
+
+        weighted_log_prob = self._estimate_log_prob(x)
+        max_log_prob = torch.max(weighted_log_prob, 1).values
+        return max_log_prob
 
 
     def _estimate_log_prob(self, x):
@@ -281,10 +310,11 @@ class GaussianMixture(torch.nn.Module):
             mu = self.mu
             prec = torch.rsqrt(self.var)
 
-            log_p = torch.sum((mu * mu + x * x - 2 * x * mu) * prec, dim=2, keepdim=True)
+            log_p = torch.sum((mu * mu + x * x - 2 * x * mu) * (prec ** 2), dim=2, keepdim=True)
             log_det = torch.sum(torch.log(prec), dim=2, keepdim=True)
 
-            return -.5 * (self.n_features * np.log(2. * pi) + log_p - log_det)
+            return -.5 * (self.n_features * np.log(2. * pi) + log_p) + log_det
+
 
 
     def _calculate_log_det(self, var):
@@ -344,7 +374,6 @@ class GaussianMixture(torch.nn.Module):
             eps = (torch.eye(self.n_features) * self.eps).to(x.device)
             var = torch.sum((x - mu).unsqueeze(-1).matmul((x - mu).unsqueeze(-2)) * resp.unsqueeze(-1), dim=0,
                             keepdim=True) / torch.sum(resp, dim=0, keepdim=True).unsqueeze(-1) + eps
-
         elif self.covariance_type == "diag":
             x2 = (resp * x * x).sum(0, keepdim=True) / pi
             mu2 = mu * mu
